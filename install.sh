@@ -6,7 +6,7 @@ else
     apt-get install python3 python3-pip    
 fi
 
-pip3 install python-iptables sdp-transform flask waitress configparser pid
+pip3 install python-iptables sdp-transform flask waitress configparser pid bencodepy
 cp floki.py /usr/local/bin/
 chmod x /usr/local/bin/floki.py
 
