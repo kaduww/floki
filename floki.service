@@ -4,8 +4,7 @@ After=multi-user.target
 
 [Service]
 Type=idle
-ExecStartPre=echo 1 > /proc/sys/net/ipv4/ip_forward
-ExecStart=python3 /usr/local/bin/floki.py
+ExecStart=/usr/bin/python3 /usr/local/bin/floki.py
 Restart=always
 
 [Install]

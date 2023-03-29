@@ -374,7 +374,7 @@ if len(config) == 0:
 for interface in config:
     if "ip" in config[interface]:
         interfaces[interface]=config[interface]['ip']
-    else:
+    elif interface!="DEFAULT":
         print("IP configuration not set in interface %s, ignoring this one" % interface)
 
 try:
