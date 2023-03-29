@@ -277,7 +277,8 @@ def handle_rtpe_commands(request, UDPServerSocket, server_address):
         else:
             # if the direction is not set, use the first interface set for in and out
             body["in_iface"]=next(iter(interfaces))
-            body["out_iface"]=next(iter(interfaces))
+            body["out_iface"]=body["in_iface"]
+            #body["out_iface"]=next(iter(interfaces))
 
         body["ua_ip"]=command_decoded[b"received-from"][1].decode("utf-8")
         for flag in command_decoded[b"flags"]:
@@ -350,22 +351,21 @@ except:
     sys.exit(1)
 
 if not "general" in config:
-    print("Missing general setting in the configuration file")
-    sys.exit(1)
+    print("Missing general setting in the configuration file, using default general settings")
+else:
+    if "rtp_port_min" in config['general']:
+        port_min=int(config['general']['rtp_port_min'])
 
-if "rtp_port_min" in config['general']:
-    port_min=int(config['general']['rtp_port_min'])
+    if "rtp_port_max" in config['general']:
+        port_max=int(config['general']['rtp_port_max'])
 
-if "rtp_port_max" in config['general']:
-    port_max=int(config['general']['rtp_port_max'])
+    if "manager_ip" in config['general']:
+        manager_ip=config['general']['manager_ip']
 
-if "manager_ip" in config['general']:
-    manager_ip=config['general']['manager_ip']
+    if "manager_port" in config['general']:
+        manager_port=int(config['general']['manager_port'])
 
-if "manager_port" in config['general']:
-    manager_port=int(config['general']['manager_port'])
-
-config.pop("general")
+    config.pop("general")
 
 if len(config) == 0:
     print("No interface configuration found")
@@ -374,6 +374,8 @@ if len(config) == 0:
 for interface in config:
     if "ip" in config[interface]:
         interfaces[interface]=config[interface]['ip']
+    else:
+        print("IP configuration not set in interface %s, ignoring this one" % interface)
 
 try:
     with pid.PidFile(**pidfile):
@@ -385,7 +387,6 @@ try:
             message = bytesAddressPair[0]
             server_address = bytesAddressPair[1]
             start_new_thread(handle_rtpe_commands, (message, UDPServerSocket, server_address))
-            #handle_rtpe_commands(message, UDPServerSocket, server_address)
 
 except RuntimeError:
     print('Pidfile found')

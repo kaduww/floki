@@ -1,14 +1,14 @@
 #!/bin/bash
 
 if [ -f /etc/redhat-release ]; then
-    yum install python3 python3-pip
+    yum install -y python3 python3-pip
 else
-    apt-get install python3 python3-pip    
+    apt-get install -y python3 python3-pip    
 fi
 
 pip3 install python-iptables sdp-transform flask waitress configparser pid bencodepy
 cp floki.py /usr/local/bin/
-chmod x /usr/local/bin/floki.py
+chmod +x /usr/local/bin/floki.py
 
 mkdir -p /etc/floki/
 cp floki.conf /etc/floki/
