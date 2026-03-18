@@ -532,7 +532,7 @@ ip=10.0.0.1
 	managerIP = "0.0.0.0"
 	managerPort = 2223
 	cleanupOnStart = false
-	currentLogLevel = LogInfo
+	setLogLevel(LogInfo)
 
 	if err := loadConfig(f.Name()); err != nil {
 		t.Fatalf("loadConfig failed: %v", err)
@@ -553,8 +553,8 @@ ip=10.0.0.1
 	if !cleanupOnStart {
 		t.Error("expected cleanup_on_start=true")
 	}
-	if currentLogLevel != LogDebug {
-		t.Errorf("expected log_level=debug, got %d", currentLogLevel)
+	if getLogLevel() != LogDebug {
+		t.Errorf("expected log_level=debug, got %d", getLogLevel())
 	}
 	if interfaces["wan"] != "1.2.3.4" {
 		t.Errorf("wan interface: got %q, want %q", interfaces["wan"], "1.2.3.4")

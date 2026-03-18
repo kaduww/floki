@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -50,13 +51,16 @@ const (
 )
 
 var (
-	currentLogLevel  = LogInfo
-	logLevelNames    = map[string]LogLevel{"debug": LogDebug, "info": LogInfo, "warn": LogWarn, "error": LogError}
-	logLevelPrefixes = map[LogLevel]string{LogDebug: "DEBUG", LogInfo: "INFO", LogWarn: "WARN", LogError: "ERROR"}
+	currentLogLevel  int32 = int32(LogInfo) // accessed atomically
+	logLevelNames          = map[string]LogLevel{"debug": LogDebug, "info": LogInfo, "warn": LogWarn, "error": LogError}
+	logLevelPrefixes       = map[LogLevel]string{LogDebug: "DEBUG", LogInfo: "INFO", LogWarn: "WARN", LogError: "ERROR"}
 )
 
+func getLogLevel() LogLevel  { return LogLevel(atomic.LoadInt32(&currentLogLevel)) }
+func setLogLevel(l LogLevel) { atomic.StoreInt32(&currentLogLevel, int32(l)) }
+
 func logf(level LogLevel, format string, args ...interface{}) {
-	if level < currentLogLevel {
+	if level < getLogLevel() {
 		return
 	}
 	log.Printf("[%s] "+format, append([]interface{}{logLevelPrefixes[level]}, args...)...)
@@ -773,6 +777,33 @@ func startHTTPServer() {
 		})
 	})
 
+	// Log level — read and change at runtime
+	router.GET("/log_level", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"log_level": logLevelPrefixes[getLogLevel()]})
+	})
+
+	router.PUT("/log_level", func(c *gin.Context) {
+		var body struct {
+			LogLevel string `json:"log_level" binding:"required"`
+		}
+		if err := c.ShouldBindJSON(&body); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "missing field: log_level"})
+			return
+		}
+		lvl, ok := logLevelNames[strings.ToLower(body.LogLevel)]
+		if !ok {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "invalid log_level",
+				"valid": []string{"debug", "info", "warn", "error"},
+			})
+			return
+		}
+		old := logLevelPrefixes[getLogLevel()]
+		setLogLevel(lvl)
+		logf(LogInfo, "Log level changed: %s → %s", old, logLevelPrefixes[lvl])
+		c.JSON(http.StatusOK, gin.H{"log_level": logLevelPrefixes[lvl]})
+	})
+
 	// Prometheus metrics endpoint
 	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
@@ -814,7 +845,7 @@ func loadConfig(path string) error {
 		if g.HasKey("log_level") {
 			lvlStr := strings.ToLower(g.Key("log_level").String())
 			if lvl, ok := logLevelNames[lvlStr]; ok {
-				currentLogLevel = lvl
+				setLogLevel(lvl)
 			}
 		}
 	}
@@ -946,7 +977,7 @@ func main() {
 	logf(LogInfo, "Floki RTP Relay starting...")
 	logf(LogInfo, "Port range: %d-%d", portMin, portMax)
 	logf(LogInfo, "Interfaces: %v", interfaces)
-	logf(LogInfo, "Log level: %s", logLevelPrefixes[currentLogLevel])
+	logf(LogInfo, "Log level: %s", logLevelPrefixes[getLogLevel()])
 
 	go startHTTPServer()
 	startUDPServer()

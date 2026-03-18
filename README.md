@@ -20,6 +20,27 @@ SIP Client ──► OpenSIPS (rtpengine module)
 
 When a call is terminated (`delete`), the rules are removed and the ports are released.
 
+## Repository structure
+
+```
+floki/
+├── src/
+│   ├── main.go          # Application source
+│   └── main_test.go     # Unit tests
+├── configs/
+│   └── floki.conf       # Configuration template
+├── deploy/
+│   └── floki.service    # Systemd unit file
+├── scripts/
+│   └── install.sh       # Installation script
+├── opensips/
+│   └── opensips.cfg     # OpenSIPS integration example
+├── go.mod
+├── go.sum
+├── Makefile
+└── README.md
+```
+
 ## Requirements
 
 - Linux with `iptables`
@@ -78,7 +99,7 @@ sudo systemctl enable --now floki
 
 ## Systemd service
 
-The `floki.service` file defines the process behaviour under systemd.
+The `deploy/floki.service` file defines the process behaviour under systemd.
 
 ```ini
 [Unit]
@@ -195,6 +216,16 @@ sudo kill -HUP $(cat /var/run/floki.pid)
 
 The HTTP server listens on `manager_port + 1` (default: `2224`).
 
+### Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/status` | Service status and port usage stats |
+| `GET` | `/list_calls` | Active calls with endpoints and allocated ports |
+| `GET` | `/log_level` | Current log level |
+| `PUT` | `/log_level` | Change log level at runtime |
+| `GET` | `/metrics` | Prometheus metrics |
+
 ### `GET /status`
 
 ```bash
@@ -226,6 +257,28 @@ Returns the full map of active calls with their endpoints and allocated ports.
 ```bash
 curl http://localhost:2224/list_calls
 ```
+
+### `GET /log_level`
+
+Returns the current log level.
+
+```bash
+curl http://localhost:2224/log_level
+# {"log_level":"info"}
+```
+
+### `PUT /log_level`
+
+Changes the log level at runtime without restarting. Valid values: `debug`, `info`, `warn`, `error`.
+
+```bash
+curl -X PUT http://localhost:2224/log_level \
+     -H "Content-Type: application/json" \
+     -d '{"log_level": "debug"}'
+# {"log_level":"debug"}
+```
+
+The change takes effect immediately and is reflected in `journalctl -u floki -f`. It does not persist across restarts — use `log_level` in `floki.conf` for a permanent setting.
 
 ### `GET /metrics`
 
@@ -279,6 +332,26 @@ go test -v ./...
 
 # Production build (static binary)
 CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o floki ./src
+```
+
+### Makefile targets
+
+```bash
+make build        # Production binary (static, stripped)
+make build-dev    # Development binary (debug symbols)
+make build-all    # Linux amd64 + arm64 binaries
+make run          # Build and run with configs/floki.conf
+make test         # go test -v ./...
+make fmt          # go fmt ./...
+make vet          # go vet ./...
+make install      # Run scripts/install.sh
+make uninstall    # Remove binary and systemd service
+make start        # systemctl start floki
+make stop         # systemctl stop floki
+make restart      # systemctl restart floki
+make reload       # systemctl reload floki (SIGHUP)
+make status       # systemctl status floki
+make logs         # journalctl -u floki -f
 ```
 
 ## Contributors
