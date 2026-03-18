@@ -1,0 +1,28 @@
+[Unit]
+Description=Floki RTP Relay
+Documentation=https://github.com/kaduww/floki
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/floki -config /etc/floki/floki.conf
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10s
+
+PIDFile=/var/run/floki.pid
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=floki
+
+# Resource limits
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
