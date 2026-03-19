@@ -314,6 +314,26 @@ loadmodule "rtpengine.so"
 modparam("rtpengine", "rtpengine_sock", "udp:localhost:2223")
 ```
 
+## Design decisions
+
+### Asynchronous iptables insertion
+
+When Floki receives an `offer` or `answer` command, the SDP is modified in memory (port allocation and IP replacement) and the response is sent to the SIP server **immediately**, before the iptables rules are inserted.
+
+The rules are inserted in the background. This is safe because there is enough SIP signalling time between the offer/answer response and the moment RTP actually starts flowing (the SIP handshake must still complete). The iptables rules will always be in place before any media packet arrives.
+
+This design avoids a latency problem under high call volume: each `iptables` call forks a new OS process and competes for a global kernel lock. Under heavy load, rule insertion can take tens of milliseconds per rule. Waiting for it before responding would push the round-trip time above OpenSIPS's default 1-second timeout, causing the module to drop the response and fail to replace the SDP in the SIP message — resulting in no audio.
+
+If iptables insertion fails (rare), the call state is rolled back: the entry is removed from the active calls map and the allocated ports are freed. The SIP server will handle the resulting media failure via its own timeout mechanisms.
+
+### Exact-match rule deletion
+
+When a call is terminated, iptables rules are deleted using the **exact same parameters** used when inserting them (destination address, port, protocol, DNAT target), not by line number.
+
+The line-number approach (`iptables -L | grep | awk` → `iptables -D <n>`) is a two-step non-atomic operation. Under high concurrency, another goroutine can insert or delete a rule between the list and the delete, shifting the line numbers and causing the delete to fail with `iptables: Index of deletion too big`. When the PREROUTING DNAT rule fails to delete, it remains active and incoming RTP packets continue to be forwarded to the endpoint of the terminated call instead of the new one — causing audio disruption on subsequent calls that reuse the same port.
+
+Exact-match deletion (`iptables -D PREROUTING -d ... -j DNAT --to-destination ...`) is atomic at the iptables level and does not depend on rule ordering.
+
 ## Development
 
 ```bash

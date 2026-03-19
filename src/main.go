@@ -126,6 +126,7 @@ type CallInfo struct {
 	NetInfo            NetInfo                  `json:"net_info"`
 	Endpoints          map[string]*EndpointInfo `json:"endpoints,omitempty"`
 	LocalUsedPorts     []int                    `json:"local_used_ports"`
+	Rules              []pendingIPTRule         `json:"rules,omitempty"`
 	LastRequestSDPRecv string                   `json:"last_request_sdp_received,omitempty"`
 	LastRequestSDPMod  string                   `json:"last_request_sdp_modified,omitempty"`
 	LastReplySDPRecv   string                   `json:"last_reply_sdp_received,omitempty"`
@@ -292,30 +293,36 @@ var insertIPTRule = func(callID, uaIP string, uaPort, localPort int, inAddr, out
 	return nil
 }
 
-// removeIPTRule deletes all iptables rules matching the call's comment tag.
+// removeIPTRule deletes iptables rules for a call using exact rule matching.
+// This avoids the grep→line-number race condition that occurs under high load.
 // Defined as a variable to allow mocking in tests.
-var removeIPTRule = func(callID string) {
+var removeIPTRule = func(callID string, rules []pendingIPTRule) {
 	comment := iptablesComment(callID)
+	for _, r := range rules {
+		preArgs := []string{
+			"-t", "nat", "-D", "PREROUTING",
+			"-d", r.outAddr + "/32",
+			"-p", "udp", "--dport", strconv.Itoa(r.localPort),
+			"-m", "comment", "--comment", comment,
+			"-j", "DNAT", "--to-destination", fmt.Sprintf("%s:%d", r.uaIP, r.uaPort),
+		}
+		logf(LogDebug, "iptables %s", strings.Join(preArgs, " "))
+		if out, err := exec.Command("iptables", preArgs...).CombinedOutput(); err != nil {
+			logf(LogWarn, "Failed to delete PREROUTING rule for call %s port %d: %v — %s", callID, r.localPort, err, strings.TrimSpace(string(out)))
+		}
 
-	// Remove nat table rules (PREROUTING + POSTROUTING)
-	for _, chain := range []string{"PREROUTING", "POSTROUTING"} {
-		for {
-			out, err := exec.Command("sh", "-c",
-				fmt.Sprintf("iptables -t nat -L %s -n --line-numbers | grep '%s' | awk '{print $1}' | head -1", chain, comment),
-			).Output()
-			if err != nil || strings.TrimSpace(string(out)) == "" {
-				break
-			}
-			lineNum := strings.TrimSpace(string(out))
-			if delOut, delErr := exec.Command("sh", "-c",
-				fmt.Sprintf("iptables -t nat -D %s %s", chain, lineNum),
-			).CombinedOutput(); delErr != nil {
-				logf(LogWarn, "Failed to delete rule from %s line %s: %v — %s", chain, lineNum, delErr, strings.TrimSpace(string(delOut)))
-				break
-			}
+		postArgs := []string{
+			"-t", "nat", "-D", "POSTROUTING",
+			"-d", r.uaIP + "/32",
+			"-p", "udp", "--dport", strconv.Itoa(r.uaPort),
+			"-m", "comment", "--comment", comment,
+			"-j", "SNAT", "--to-source", r.inAddr,
+		}
+		logf(LogDebug, "iptables %s", strings.Join(postArgs, " "))
+		if out, err := exec.Command("iptables", postArgs...).CombinedOutput(); err != nil {
+			logf(LogWarn, "Failed to delete POSTROUTING rule for call %s port %d: %v — %s", callID, r.uaPort, err, strings.TrimSpace(string(out)))
 		}
 	}
-
 }
 
 // cleanupOrphanedRules removes all floki-owned iptables rules (called on startup when enabled).
@@ -435,8 +442,10 @@ type pendingIPTRule struct {
 // rollbackCall removes call state and allocated ports under the lock.
 // Must be called without holding mu.
 func rollbackCall(callID string) {
+	var rules []pendingIPTRule
 	mu.Lock()
 	if callInfo, exists := activeCalls[callID]; exists {
+		rules = callInfo.Rules
 		for _, p := range callInfo.LocalUsedPorts {
 			delete(usedPorts, p)
 		}
@@ -445,7 +454,7 @@ func rollbackCall(callID string) {
 		metricActiveCalls.Dec()
 	}
 	mu.Unlock()
-	removeIPTRule(callID)
+	removeIPTRule(callID, rules)
 }
 
 // handleRequest processes offer commands.
@@ -512,6 +521,7 @@ func handleRequest(cmd *Command) Response {
 			NetInfo:            NetInfo{InAddr: inAddr, OutAddr: outAddr},
 			Endpoints:          map[string]*EndpointInfo{cmd.UAIP: {LocalOutAddr: outAddr, MediaList: mediaList}},
 			LocalUsedPorts:     localUsedPorts,
+			Rules:              pending,
 			LastRequestSDPRecv: cmd.SDP,
 			LastRequestSDPMod:  modifiedSDP,
 		}
@@ -536,15 +546,21 @@ func handleRequest(cmd *Command) Response {
 	}
 	mu.Unlock()
 
-	// Insert iptables rules outside the lock — concurrent with other call setups
+	// Insert iptables rules asynchronously — the SDP is already computed and will be
+	// returned to the caller immediately. Rules must be in place before RTP flows,
+	// but there is enough SIP signalling time between the offer response and actual
+	// media flow that background insertion is safe.
 	if newCall {
-		for _, r := range pending {
-			if err := insertIPTRule(cmd.CallID, r.uaIP, r.uaPort, r.localPort, r.inAddr, r.outAddr); err != nil {
-				logf(LogError, "iptables insertion failed for call %s: %v", cmd.CallID, err)
-				rollbackCall(cmd.CallID)
-				return Response{Result: 0, CallID: cmd.CallID, Cause: "Failed to insert iptables rule: " + err.Error()}
+		callID := cmd.CallID
+		go func() {
+			for _, r := range pending {
+				if err := insertIPTRule(callID, r.uaIP, r.uaPort, r.localPort, r.inAddr, r.outAddr); err != nil {
+					logf(LogError, "iptables insertion failed for call %s: %v", callID, err)
+					rollbackCall(callID)
+					return
+				}
 			}
-		}
+		}()
 	}
 
 	return Response{Result: 1, CallID: cmd.CallID, SDP: modifiedSDP}
@@ -610,6 +626,7 @@ func handleReply(cmd *Command) Response {
 		modifiedSDP = writeSDP(sdpDict)
 		callInfo.Endpoints[cmd.UAIP] = &EndpointInfo{LocalOutAddr: outAddr, MediaList: mediaList}
 		callInfo.LocalUsedPorts = append(callInfo.LocalUsedPorts, localUsedPorts...)
+		callInfo.Rules = append(callInfo.Rules, pending...)
 		callInfo.LastReplySDPRecv = cmd.SDP
 		callInfo.LastReplySDPMod = modifiedSDP
 	} else {
@@ -632,15 +649,18 @@ func handleReply(cmd *Command) Response {
 	}
 	mu.Unlock()
 
-	// Insert iptables rules outside the lock — concurrent with other call setups
+	// Insert iptables rules asynchronously — same rationale as handleRequest.
 	if newEndpoint {
-		for _, r := range pending {
-			if err := insertIPTRule(cmd.CallID, r.uaIP, r.uaPort, r.localPort, r.inAddr, r.outAddr); err != nil {
-				logf(LogError, "iptables insertion failed for call %s (answer): %v", cmd.CallID, err)
-				rollbackCall(cmd.CallID)
-				return Response{Result: 0, CallID: cmd.CallID, Cause: "Failed to insert iptables rule: " + err.Error()}
+		callID := cmd.CallID
+		go func() {
+			for _, r := range pending {
+				if err := insertIPTRule(callID, r.uaIP, r.uaPort, r.localPort, r.inAddr, r.outAddr); err != nil {
+					logf(LogError, "iptables insertion failed for call %s (answer): %v", callID, err)
+					rollbackCall(callID)
+					return
+				}
 			}
-		}
+		}()
 	}
 
 	return Response{Result: 1, CallID: cmd.CallID, SDP: modifiedSDP}
@@ -761,8 +781,10 @@ func handleRTPECommands(data []byte, conn *net.UDPConn, addr *net.UDPAddr) {
 			break
 		}
 
+		var rules []pendingIPTRule
 		mu.Lock()
 		if callInfo, exists := activeCalls[callID]; exists {
+			rules = callInfo.Rules
 			for _, port := range callInfo.LocalUsedPorts {
 				delete(usedPorts, port)
 			}
@@ -772,7 +794,7 @@ func handleRTPECommands(data []byte, conn *net.UDPConn, addr *net.UDPAddr) {
 		}
 		mu.Unlock()
 
-		removeIPTRule(callID)
+		removeIPTRule(callID, rules)
 		reply["result"] = "ok"
 	}
 
@@ -992,24 +1014,28 @@ func setupSignalHandlers(cfgPath *string) {
 		sig := <-shutdownCh
 		logf(LogInfo, "Received signal %v, shutting down...", sig)
 
+		type callCleanup struct {
+			id    string
+			rules []pendingIPTRule
+		}
 		mu.Lock()
-		callIDs := make([]string, 0, len(activeCalls))
+		callsToClean := make([]callCleanup, 0, len(activeCalls))
 		for id, callInfo := range activeCalls {
 			for _, port := range callInfo.LocalUsedPorts {
 				delete(usedPorts, port)
 			}
-			callIDs = append(callIDs, id)
+			callsToClean = append(callsToClean, callCleanup{id: id, rules: callInfo.Rules})
 		}
 		activeCalls = make(map[string]*CallInfo)
 		mu.Unlock()
 
-		for _, id := range callIDs {
-			removeIPTRule(id)
+		for _, cc := range callsToClean {
+			removeIPTRule(cc.id, cc.rules)
 		}
 		if autoManageFilter {
 			removeStaticForwardRules()
 		}
-		logf(LogInfo, "Cleaned up %d active call(s). Goodbye.", len(callIDs))
+		logf(LogInfo, "Cleaned up %d active call(s). Goodbye.", len(callsToClean))
 		removePIDFile(pidFile)
 		os.Exit(0)
 	}()

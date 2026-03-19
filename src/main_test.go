@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -32,7 +33,7 @@ func noopIPTables() {
 	insertIPTRule = func(callID, uaIP string, uaPort, localPort int, inAddr, outAddr string) error {
 		return nil
 	}
-	removeIPTRule = func(callID string) {}
+	removeIPTRule = func(callID string, rules []pendingIPTRule) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -395,9 +396,12 @@ func TestHandleRequest_InvalidCallID(t *testing.T) {
 
 func TestHandleRequest_IPTablesError(t *testing.T) {
 	resetState()
+	done := make(chan struct{})
 	insertIPTRule = func(callID, uaIP string, uaPort, localPort int, inAddr, outAddr string) error {
+		defer close(done)
 		return fmt.Errorf("iptables not available")
 	}
+	removeIPTRule = func(callID string, rules []pendingIPTRule) {}
 
 	cmd := &Command{
 		CallID:   "fail-call",
@@ -408,11 +412,31 @@ func TestHandleRequest_IPTablesError(t *testing.T) {
 	}
 	resp := handleRequest(cmd)
 
-	if resp.Result != 0 {
-		t.Error("expected Result=0 when iptables insertion fails")
+	// iptables insertion is async: the SDP response is returned immediately
+	if resp.Result != 1 {
+		t.Errorf("expected Result=1 (SDP computed before async iptables), got %d", resp.Result)
 	}
-	if resp.Cause == "" {
-		t.Error("expected non-empty Cause on iptables failure")
+	if resp.SDP == "" {
+		t.Error("expected non-empty SDP in response")
+	}
+
+	// Wait for the async goroutine to fail and rollback
+	<-done
+	// Give rollback a moment to complete
+	for i := 0; i < 10; i++ {
+		mu.RLock()
+		_, exists := activeCalls["fail-call"]
+		mu.RUnlock()
+		if !exists {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	mu.RLock()
+	defer mu.RUnlock()
+	if _, exists := activeCalls["fail-call"]; exists {
+		t.Error("expected call to be rolled back after iptables failure")
 	}
 }
 
