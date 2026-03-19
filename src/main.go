@@ -75,8 +75,10 @@ var (
 	portMax        = 32767
 	managerIP      = "0.0.0.0"
 	managerPort    = 2223
-	pidFile        = "/var/run/floki.pid"
-	cleanupOnStart = false
+	pidFile          = "/var/run/floki.pid"
+	cleanupOnStart   = false
+	enableIPForward    = false
+	autoManageFilter = false
 	activeConfigPath string
 
 	nextPort       = portMin
@@ -208,6 +210,51 @@ func iptablesComment(callID string) string {
 	return "floki:" + callID
 }
 
+const forwardRangeComment = "floki:forward-range"
+
+// insertStaticForwardRules inserts a single FORWARD ACCEPT rule covering the
+// entire RTP port range using conntrack's original destination port. This avoids
+// adding/removing per-call FORWARD rules and is called once at startup.
+func insertStaticForwardRules() error {
+	portRange := fmt.Sprintf("%d:%d", portMin, portMax)
+	for _, chain := range []string{"INPUT", "FORWARD"} {
+		args := []string{
+			"-t", "filter", "-I", chain,
+			"-p", "udp",
+			"-m", "conntrack", "--ctorigdstport", portRange,
+			"-m", "comment", "--comment", forwardRangeComment,
+			"-j", "ACCEPT",
+		}
+		logf(LogDebug, "iptables %s", strings.Join(args, " "))
+		if out, err := exec.Command("iptables", args...).CombinedOutput(); err != nil {
+			return fmt.Errorf("static %s rule failed: %v — %s", chain, err, strings.TrimSpace(string(out)))
+		}
+	}
+	logf(LogInfo, "Static INPUT/FORWARD rules inserted for port range %d-%d", portMin, portMax)
+	return nil
+}
+
+// removeStaticForwardRules removes the static INPUT/FORWARD rules inserted at startup.
+func removeStaticForwardRules() {
+	for _, chain := range []string{"INPUT", "FORWARD"} {
+		for {
+			out, err := exec.Command("sh", "-c",
+				fmt.Sprintf("iptables -t filter -L %s -n --line-numbers | grep '%s' | awk '{print $1}' | head -1", chain, forwardRangeComment),
+			).Output()
+			if err != nil || strings.TrimSpace(string(out)) == "" {
+				break
+			}
+			lineNum := strings.TrimSpace(string(out))
+			if delOut, delErr := exec.Command("sh", "-c",
+				fmt.Sprintf("iptables -t filter -D %s %s", chain, lineNum),
+			).CombinedOutput(); delErr != nil {
+				logf(LogWarn, "Failed to delete static %s rule line %s: %v — %s", chain, lineNum, delErr, strings.TrimSpace(string(delOut)))
+				break
+			}
+		}
+	}
+}
+
 // insertIPTRule inserts DNAT+SNAT rules for an RTP stream.
 // Defined as a variable to allow mocking in tests.
 var insertIPTRule = func(callID, uaIP string, uaPort, localPort int, inAddr, outAddr string) error {
@@ -221,6 +268,7 @@ var insertIPTRule = func(callID, uaIP string, uaPort, localPort int, inAddr, out
 		"-m", "comment", "--comment", comment,
 		"-j", "DNAT", "--to-destination", fmt.Sprintf("%s:%d", uaIP, uaPort),
 	}
+	logf(LogDebug, "iptables %s", strings.Join(preArgs, " "))
 	if out, err := exec.Command("iptables", preArgs...).CombinedOutput(); err != nil {
 		metricIptablesErrors.Inc()
 		return fmt.Errorf("PREROUTING rule failed: %v — %s", err, strings.TrimSpace(string(out)))
@@ -234,6 +282,7 @@ var insertIPTRule = func(callID, uaIP string, uaPort, localPort int, inAddr, out
 		"-m", "comment", "--comment", comment,
 		"-j", "SNAT", "--to-source", inAddr,
 	}
+	logf(LogDebug, "iptables %s", strings.Join(postArgs, " "))
 	if out, err := exec.Command("iptables", postArgs...).CombinedOutput(); err != nil {
 		metricIptablesErrors.Inc()
 		return fmt.Errorf("POSTROUTING rule failed: %v — %s", err, strings.TrimSpace(string(out)))
@@ -247,6 +296,8 @@ var insertIPTRule = func(callID, uaIP string, uaPort, localPort int, inAddr, out
 // Defined as a variable to allow mocking in tests.
 var removeIPTRule = func(callID string) {
 	comment := iptablesComment(callID)
+
+	// Remove nat table rules (PREROUTING + POSTROUTING)
 	for _, chain := range []string{"PREROUTING", "POSTROUTING"} {
 		for {
 			out, err := exec.Command("sh", "-c",
@@ -264,6 +315,7 @@ var removeIPTRule = func(callID string) {
 			}
 		}
 	}
+
 }
 
 // cleanupOrphanedRules removes all floki-owned iptables rules (called on startup when enabled).
@@ -282,6 +334,7 @@ func cleanupOrphanedRules() {
 		}
 		logf(LogInfo, "Chain %s cleaned", chain)
 	}
+
 }
 
 // ---------------------------------------------------------------------------
@@ -431,6 +484,10 @@ func handleRequest(cmd *Command) Response {
 		var localUsedPorts []int
 		for i, m := range sdpDict["media"].([]map[string]interface{}) {
 			uaPort := m["port"].(int)
+			if uaPort == 0 {
+				// Port 0 means the media stream is rejected/disabled — skip relay
+				continue
+			}
 			localPort, ok := getNewPort(cmd.CallID)
 			if !ok {
 				for _, p := range localUsedPorts {
@@ -529,6 +586,10 @@ func handleReply(cmd *Command) Response {
 		var localUsedPorts []int
 		for i, m := range sdpDict["media"].([]map[string]interface{}) {
 			uaPort := m["port"].(int)
+			if uaPort == 0 {
+				// Port 0 means the media stream is rejected/disabled — skip relay
+				continue
+			}
 			localPort, ok := getNewPort(cmd.CallID)
 			if !ok {
 				for _, p := range localUsedPorts {
@@ -842,6 +903,12 @@ func loadConfig(path string) error {
 		if g.HasKey("cleanup_on_start") {
 			cleanupOnStart, _ = g.Key("cleanup_on_start").Bool()
 		}
+		if g.HasKey("enable_ip_forward") {
+			enableIPForward, _ = g.Key("enable_ip_forward").Bool()
+		}
+		if g.HasKey("auto_manage_filter") {
+			autoManageFilter, _ = g.Key("auto_manage_filter").Bool()
+		}
 		if g.HasKey("log_level") {
 			lvlStr := strings.ToLower(g.Key("log_level").String())
 			if lvl, ok := logLevelNames[lvlStr]; ok {
@@ -864,6 +931,18 @@ func loadConfig(path string) error {
 	if len(interfaces) == 0 {
 		return fmt.Errorf("no interface configuration found")
 	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// IP forwarding
+// ---------------------------------------------------------------------------
+
+func enableKernelIPForward() error {
+	if out, err := exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").CombinedOutput(); err != nil {
+		return fmt.Errorf("sysctl failed: %v — %s", err, strings.TrimSpace(string(out)))
+	}
+	logf(LogInfo, "Kernel IP forwarding enabled (net.ipv4.ip_forward=1)")
 	return nil
 }
 
@@ -927,6 +1006,9 @@ func setupSignalHandlers(cfgPath *string) {
 		for _, id := range callIDs {
 			removeIPTRule(id)
 		}
+		if autoManageFilter {
+			removeStaticForwardRules()
+		}
 		logf(LogInfo, "Cleaned up %d active call(s). Goodbye.", len(callIDs))
 		removePIDFile(pidFile)
 		os.Exit(0)
@@ -960,8 +1042,21 @@ func main() {
 	}
 	activeConfigPath = *cfgPath
 
+	if enableIPForward {
+		if err := enableKernelIPForward(); err != nil {
+			log.Fatalf("[ERROR] Failed to enable IP forwarding: %v", err)
+		}
+	}
+
 	if cleanupOnStart {
 		cleanupOrphanedRules()
+	}
+
+	if autoManageFilter {
+		removeStaticForwardRules() // remove any leftover rule from a previous run
+		if err := insertStaticForwardRules(); err != nil {
+			log.Fatalf("[ERROR] Failed to insert static FORWARD rules: %v", err)
+		}
 	}
 
 	if err := checkPIDFile(pidFile); err != nil {
