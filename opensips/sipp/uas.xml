@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  UAS Load Test Scenario for Floki RTP Relay
+  ============================================
+  Flow:
+    1. Receive INVITE
+    2. Send 100 Trying
+    3. Send 183 Session Progress with SDP (early media)
+    4. Send 200 OK with SDP
+    5. Receive ACK
+    6. Receive BYE
+    7. Send 200 OK
+
+  Usage:
+    sipp -sf uas.xml -p 5061 -t u1
+
+  Note: Start UAS before UAC.
+-->
+
+<scenario name="UAS - INVITE/183/200 Load Test">
+
+  <!-- Wait for incoming INVITE -->
+  <recv request="INVITE" crlf="true">
+  </recv>
+
+  <!-- 100 Trying — immediate, no SDP -->
+  <send>
+    <![CDATA[
+SIP/2.0 100 Trying
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Simulate early media delay (200ms) then send 183 -->
+  <pause milliseconds="200"/>
+
+  <send>
+    <![CDATA[
+SIP/2.0 183 Session Progress
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:uas@[local_ip]:[local_port]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=uas 53655765 2353687638 IN IP4 [local_ip]
+s=Floki Load Test
+c=IN IP4 [local_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=sendrecv
+
+    ]]>
+  </send>
+
+  <!-- Simulate ring time before answering (1s) -->
+  <pause milliseconds="1000"/>
+
+  <!-- 200 OK — call answered -->
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:uas@[local_ip]:[local_port]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=uas 53655765 2353687638 IN IP4 [local_ip]
+s=Floki Load Test
+c=IN IP4 [local_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=sendrecv
+
+    ]]>
+  </send>
+
+  <!-- Wait for ACK -->
+  <recv request="ACK" optional="false" crlf="true" />
+
+  <!-- Wait for BYE (with a generous timeout for long call durations) -->
+  <recv request="BYE" crlf="true" />
+
+  <!-- 200 OK for BYE -->
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:uas@[local_ip]:[local_port]>
+Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Stats buckets -->
+  <ResponseTimeRepartition value="10, 20, 50, 100, 200, 500, 1000, 2000"/>
+  <CallLengthRepartition value="100, 500, 1000, 2000, 5000, 10000, 30000"/>
+
+</scenario>

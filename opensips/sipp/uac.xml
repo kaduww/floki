@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  UAC Load Test Scenario for Floki RTP Relay
+  ============================================
+  Flow:
+    1. Send INVITE with SDP
+    2. Receive 100 Trying (optional)
+    3. Receive 183 Session Progress (early media)
+    4. Receive 200 OK
+    5. Send ACK
+    6. Hold call for [pause] ms
+    7. Send BYE
+    8. Receive 200 OK
+
+  Usage:
+    sipp <opensips_ip>:<port> -sf uac.xml -s 1000 \
+      -l 500 -r 50 -rp 1000 -d 5000 -t u1
+-->
+
+<scenario name="UAC - INVITE/183/200 Load Test">
+
+  <!-- ============================================================
+       INVITE with SDP offer
+       [media_port] = SIPp auto-allocated RTP port
+       ============================================================ -->
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+To: service <sip:[service]@[remote_ip]:[remote_port]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:sipp@[local_ip]:[local_port]>
+Max-Forwards: 70
+Allow: INVITE, ACK, BYE, CANCEL, OPTIONS
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=sipp 53655765 2353687637 IN IP4 [local_ip]
+s=Floki Load Test
+c=IN IP4 [local_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=sendrecv
+
+    ]]>
+  </send>
+
+  <!-- 100 Trying is optional -->
+  <recv response="100" optional="true" />
+
+  <!-- 183 Session Progress with early SDP -->
+  <recv response="183" optional="false" rrs="true">
+  </recv>
+
+  <!-- 200 OK — marks call as established for RTD stats -->
+  <recv response="200" rtd="true" crlf="true">
+  </recv>
+
+  <!-- ACK for the 200 OK -->
+  <send>
+    <![CDATA[
+ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+To: service <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Contact: <sip:sipp@[local_ip]:[local_port]>
+Max-Forwards: 70
+Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Simulate call duration (default 5s, override with -d flag) -->
+  <pause/>
+
+  <!-- BYE to terminate the call -->
+  <send retrans="500">
+    <![CDATA[
+BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]
+To: service <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 BYE
+Contact: <sip:sipp@[local_ip]:[local_port]>
+Max-Forwards: 70
+Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Final 200 OK for BYE -->
+  <recv response="200" crlf="true" />
+
+  <!-- Stats buckets -->
+  <ResponseTimeRepartition value="10, 20, 50, 100, 200, 500, 1000, 2000"/>
+  <CallLengthRepartition value="100, 500, 1000, 2000, 5000, 10000, 30000"/>
+
+</scenario>
